@@ -6,9 +6,13 @@ function(llama_build source)
     else()
         get_filename_component(TEST_TARGET ${source} NAME_WE)
     endif()
-
     add_executable(${TEST_TARGET} ${source})
-    target_link_libraries(${TEST_TARGET} PRIVATE common)
+    if (GGML_ZENDNN)
+       target_link_libraries(${TEST_TARGET} PRIVATE common blis-mt m amdZenDNN)
+    endif()
+    if (NOT GGML_ZENDNN)
+        target_link_libraries(${TEST_TARGET} PRIVATE common blis-mt m amdZenDNN)
+    endif()
     install(TARGETS ${TEST_TARGET} RUNTIME)
 endfunction()
 
@@ -97,7 +101,7 @@ function(llama_build_and_test source)
 
     add_executable(${TEST_TARGET} ${source} get-model.cpp)
     install(TARGETS ${TEST_TARGET} RUNTIME)
-    target_link_libraries(${TEST_TARGET} PRIVATE common)
+    target_link_libraries(${TEST_TARGET} PRIVATE common blis-mt m amdZenDNN)
 
     add_test(
         NAME ${TEST_TARGET}
@@ -217,12 +221,17 @@ endif()
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd amdZenDNN blis-mt m)
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
-target_link_libraries(${TEST_TARGET} PRIVATE llama)
+target_link_libraries(${TEST_TARGET} PRIVATE llama amdZenDNN blis-mt m)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+if (GGML_ZENDNN)
+       add_executable(test-zendnn-basic test-zendnn-basic.cpp)
+       target_link_libraries(test-zendnn-basic amdZenDNN blis-mt m)
+endif()

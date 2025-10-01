@@ -183,6 +183,35 @@ if (MINGW)
     add_compile_definitions(_WIN32_WINNT=${GGML_WIN_VER})
 endif()
 
+option(GGML_ZENDNN "ggml: use ZenDNN" OFF)
+   
+   if (GGML_ZENDNN)
+       # Try cmake arg first, then env var
+       if (NOT DEFINED ZENDNN_PATH)
+           set(ZENDNN_PATH $ENV{ZENDNN_PATH})
+       endif()
+       
+       if (NOT ZENDNN_PATH)
+           message(FATAL_ERROR "ZENDNN_PATH not set. Use -DZENDNN_PATH=... or export ZENDNN_PATH")
+       endif()
+       
+       if (NOT EXISTS ${ZENDNN_PATH})
+           message(FATAL_ERROR "ZENDNN_PATH does not exist: ${ZENDNN_PATH}")
+       endif()
+       
+       # ZenDNN headers + libs
+       include_directories(${ZENDNN_PATH}/inc)
+       link_directories(${ZENDNN_PATH}/_out/lib)
+       
+       # BLIS headers + libs
+       include_directories(${ZENDNN_PATH}/third_party/amd-blis/include)
+       link_directories(${ZENDNN_PATH}/third_party/amd-blis/lib/LP64)
+       
+       add_compile_definitions(GGML_USE_ZENDNN)
+       
+       message(STATUS "ZenDNN path: ${ZENDNN_PATH}")
+   endif()
+
 #
 # build the library
 #

@@ -53,7 +53,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "simd-mappings.h"
-
+#include "zendnn.hpp"
 #include <array>
 #include <type_traits>
 
@@ -2678,7 +2678,10 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     assert(ldc >= m);
     assert(params->nth > 0);
     assert(params->ith < params->nth);
-
+    zendnn::engine eng(zendnn::engine::kind::cpu, 0);   
+    printf("ZenDNN engine created: %s\n", 
+              eng.get_kind() == zendnn::engine::kind::cpu ? "CPU" : "Unknown");
+       
     // only enable sgemm for prompt processing
 #if !defined(__MMA__)
     if (n < 2)

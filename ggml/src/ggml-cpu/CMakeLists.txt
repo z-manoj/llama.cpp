@@ -10,6 +10,10 @@ function(ggml_add_cpu_backend_features cpu_name arch)
     target_compile_definitions(${GGML_CPU_FEATS_NAME} PRIVATE GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
     set_target_properties(${GGML_CPU_FEATS_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_link_libraries(${cpu_name} PRIVATE ${GGML_CPU_FEATS_NAME})
+    if (GGML_ZENDNN)
+    # make sure ggml-base or ggml-cpu pulls in ZenDNN
+    target_link_libraries(${cpu_name}  PRIVATE amdZenDNN blis-mt m)
+endif()
 endfunction()
 
 function(ggml_add_cpu_backend_variant_impl tag_name)
@@ -74,6 +78,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
 
             target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+            target_link_libraries(${GGML_CPU_NAME}  PRIVATE amdZenDNN blis-mt m)
         else()
             set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
             message(WARNING "OpenMP not found")
@@ -96,6 +101,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_HBM)
 
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
+        target_link_libraries(${GGML_CPU_NAME}  PRIVATE amdZenDNN blis-mt m)
     endif()
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")

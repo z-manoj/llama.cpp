@@ -2949,7 +2949,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             int64_t ldb_colmajor = k;
             for (int64_t j = 0; j < n; ++j) {
                 for (int64_t i = 0; i < k; ++i) {
-                    B_colmajor[j * ldb_colmajor + i] = ((const ggml_bf16_t*)B)[i * ldb + j];
+                    B_colmajor[j * ldb_colmajor + i] = ((const ggml_bf16_t*)B)[j * ldb + i];
                 }
             }
 

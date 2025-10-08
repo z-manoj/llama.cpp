@@ -2639,34 +2639,12 @@ class tinyBLAS_PPC {
 
 
 
-void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
-                       const ggml_bf16_t* A, int64_t lda,
-                       const ggml_bf16_t* B, int64_t ldb,
-                       float* C, int64_t ldc,
-                       const ggml_compute_params* params);
-
-void transpose_bf16_col_to_row(const ggml_bf16_t* src, ggml_bf16_t* dst,
-                               int64_t rows, int64_t cols, int64_t ld_src);
-
-void transpose_f32_row_to_col(const float* src, float* dst,
-                              int64_t rows, int64_t cols, int64_t ld_src);
-
-void zendnn_sgemm_bf16_internal_rowmajor(int64_t m, int64_t n, int64_t k,
-                                         const ggml_bf16_t* A, int64_t lda,
-                                         const ggml_bf16_t* B, int64_t ldb,
-                                         float* C, int64_t ldc);
-
-void zendnn_sgemm_bf16_pure_rowmajor(int64_t m, int64_t n, int64_t k,
-                                     const ggml_bf16_t* A, int64_t lda,
-                                     const ggml_bf16_t* B, int64_t ldb,
-                                     float* C, int64_t ldc);
-
-double calculate_similarity_score(const float* mat1, const float* mat2,
-                                  int64_t m, int64_t n, int64_t ldc, float tol);
-
 #include<omp.h>
 using namespace zendnn;// Include OpenMP for dynamic thread control
 
+
+
+//      --------------              WORKING CODE        ----------------
 // Updated ZendNN function with static engine/stream for reuse
 void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
                        const ggml_bf16_t* A, int64_t lda,
@@ -2730,16 +2708,15 @@ void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
 
 
 
+//  -----------         Transposing     ------------------
 
+// --- Transposition Logic ---
 
-
-
-
-
-
-
+/**
+ * @brief Transposes a BF16 matrix from column-major to row-major layout.
+ */
 void transpose_bf16_col_to_row(const ggml_bf16_t* src, ggml_bf16_t* dst,
-                                int64_t num_rows, int64_t num_cols, int64_t lds) {
+                               int64_t num_rows, int64_t num_cols, int64_t lds) {
     #pragma omp parallel for
     for (int64_t j = 0; j < num_cols; ++j) {
         for (int64_t i = 0; i < num_rows; ++i) {
@@ -2750,8 +2727,11 @@ void transpose_bf16_col_to_row(const ggml_bf16_t* src, ggml_bf16_t* dst,
     }
 }
 
-void transpose_f32_row_to_col(const float* src, float* dst,
-                                int64_t num_rows, int64_t num_cols, int64_t ldd) {
+/**
+ * @brief Transposes a BF16 matrix from row-major to column-major layout.
+ */
+void transpose_bf16_row_to_col(const ggml_bf16_t* src, ggml_bf16_t* dst,
+                               int64_t num_rows, int64_t num_cols, int64_t ldd) {
     #pragma omp parallel for
     for (int64_t j = 0; j < num_cols; ++j) {
         for (int64_t i = 0; i < num_rows; ++i) {
@@ -2762,76 +2742,102 @@ void transpose_f32_row_to_col(const float* src, float* dst,
     }
 }
 
-void transpose_bf16_row_to_col(const ggml_bf16_t* src, ggml_bf16_t* dst,
-                                int64_t rows, int64_t cols, int64_t ld_src, int64_t ld_dst) {
-    for (int64_t c = 0; c < cols; ++c) {
-        for (int64_t r = 0; r < rows; ++r) {
-            dst[c * ld_dst + r] = src[r * ld_src + c];
+/**
+ * @brief Transposes a Float32 matrix from row-major to column-major layout.
+ */
+void transpose_f32_row_to_col(const float* src, float* dst,
+                              int64_t num_rows, int64_t num_cols, int64_t ldd) {
+    #pragma omp parallel for
+    for (int64_t j = 0; j < num_cols; ++j) {
+        for (int64_t i = 0; i < num_rows; ++i) {
+            // Read from row-major src: src[i * num_cols + j]
+            // Write to col-major dst:  dst[i + j * ldd]
+            dst[i + j * ldd] = src[i * num_cols + j];
         }
     }
 }
 
-void transpose_f32_col_to_row(const float* src, float* dst,
-                              int64_t rows, int64_t cols, int64_t ld_src, int64_t ld_dst) {
-    for (int64_t c = 0; c < cols; ++c) {
-        for (int64_t r = 0; r < rows; ++r) {
-            dst[r * ld_dst + c] = src[c * ld_src + r];
-        }
-    }
-}
 
-void zendnn_sgemm_bf16_internal_rowmajor(int64_t m, int64_t n, int64_t k,
-                                          const ggml_bf16_t* A, int64_t lda,
-                                          const ggml_bf16_t* B_rowmajor, int64_t ldb_rowmajor,
-                                          float* C_rowmajor, int64_t ldc_rowmajor) {
+
+
+
+//      --------------      Trying Layouts       ----------------
+
+void zendnn_sgemm_bf16_with_formats(memory::format_tag src_tag, memory::format_tag weights_tag, memory::format_tag dst_tag,
+                                    int64_t m, int64_t n, int64_t k,
+                                    const ggml_bf16_t* A_orig_rowmajor, int64_t lda_rowmajor,
+                                    const ggml_bf16_t* B_orig_colmajor, int64_t ldb_colmajor,
+                                    float* C_out_colmajor, int64_t ldc_colmajor) {
     static engine eng(engine::kind::cpu, 0);
     static stream s(eng);
 
-    memory::dims src_dims     = {m, k};
+    memory::dims src_dims = {m, k};
     memory::dims weights_dims = {k, n};
-    memory::dims dst_dims     = {m, n};
+    memory::dims dst_dims = {m, n};
 
-    // PURE ROW-MAJOR: All descriptors are defined as row-major ('ab' -> {stride, 1})
-    memory::desc src_md(src_dims, memory::data_type::bf16, {lda, 1});
-    memory::desc weights_md(weights_dims, memory::data_type::bf16, {ldb_rowmajor, 1});
-    memory::desc dst_md(dst_dims, memory::data_type::f32, {ldc_rowmajor, 1});
+    memory::desc src_md(src_dims, memory::data_type::bf16, src_tag);
+    memory::desc weights_md(weights_dims, memory::data_type::bf16, weights_tag);
+    memory::desc dst_md(dst_dims, memory::data_type::f32, dst_tag);
 
-    memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(A));
-    memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(B_rowmajor));
-    memory dst_mem(dst_md, eng, C_rowmajor);
+    // Prepare A buffer if needed
+    std::vector<ggml_bf16_t> A_buffer;
+    ggml_bf16_t* A_ptr = const_cast<ggml_bf16_t*>(A_orig_rowmajor);
+    if (src_tag == memory::format_tag::ba) {
+        A_buffer.resize(m * k);
+        transpose_bf16_row_to_col(A_orig_rowmajor, A_buffer.data(), m, k, m);  // ldd = m for col-major
+        A_ptr = A_buffer.data();
+    }
+
+    // Prepare B buffer if needed
+    std::vector<ggml_bf16_t> B_buffer;
+    ggml_bf16_t* B_ptr = const_cast<ggml_bf16_t*>(B_orig_colmajor);
+    if (weights_tag == memory::format_tag::ab) {
+        B_buffer.resize(k * n);
+        transpose_bf16_col_to_row(B_orig_colmajor, B_buffer.data(), k, n, k);  // lds = k for col-major src
+        B_ptr = B_buffer.data();
+    }
+
+    // Allocate C buffer
+    std::vector<float> C_buffer(m * n);
+    float* C_ptr = C_buffer.data();
+
+    memory src_mem(src_md, eng, A_ptr);
+    memory weights_mem(weights_md, eng, B_ptr);
+    memory dst_mem(dst_md, eng, C_ptr);
 
     matmul::desc matmul_d(src_md, weights_md, dst_md);
     matmul::primitive_desc matmul_pd(matmul_d, eng);
     matmul matmul_prim(matmul_pd);
 
-    matmul_prim.execute(s, {{ZENDNN_ARG_SRC, src_mem}, {ZENDNN_ARG_WEIGHTS, weights_mem}, {ZENDNN_ARG_DST, dst_mem}});
+    // Warm-up
+    std::vector<float> warmup_C(m * n, 0.f);
+    memory warmup_mem(dst_md, eng, warmup_C.data());
+    for (int i = 0; i < 5; ++i) {
+        matmul_prim.execute(s, {
+            {ZENDNN_ARG_SRC, src_mem},
+            {ZENDNN_ARG_WEIGHTS, weights_mem},
+            {ZENDNN_ARG_DST, warmup_mem}
+        });
+    }
     s.wait();
+
+    // Final execution
+    matmul_prim.execute(s, {
+        {ZENDNN_ARG_SRC, src_mem},
+        {ZENDNN_ARG_WEIGHTS, weights_mem},
+        {ZENDNN_ARG_DST, dst_mem}
+    });
+    s.wait();
+
+    // Convert C to col-major if needed
+    if (dst_tag == memory::format_tag::ba) {
+        // Both col-major
+        std::copy(C_buffer.begin(), C_buffer.end(), C_out_colmajor);
+    } else {
+        // dst is row-major, transpose to col-major
+        transpose_f32_row_to_col(C_buffer.data(), C_out_colmajor, m, n, ldc_colmajor);
+    }
 }
-
-void zendnn_sgemm_bf16_pure_rowmajor(int64_t m, int64_t n, int64_t k,
-                                      const ggml_bf16_t* A, int64_t lda,
-                                      const ggml_bf16_t* B_colmajor, int64_t ldb_colmajor,
-                                      float* C_colmajor, int64_t ldc_colmajor) {
-    // 1. Allocate temporary buffers for row-major versions of B and C.
-    std::vector<ggml_bf16_t> B_rowmajor_buffer(k * n);
-    std::vector<float> C_rowmajor_buffer(m * n);
-
-    // 2. Transpose input B from column-major to row-major.
-    transpose_bf16_col_to_row(B_colmajor, B_rowmajor_buffer.data(), k, n, ldb_colmajor);
-
-    // 3. Call the internal computation kernel, which reads and writes row-major data.
-    int64_t ldb_rowmajor = n;
-    int64_t ldc_rowmajor = n;
-    zendnn_sgemm_bf16_internal_rowmajor(m, n, k,
-                                        A, lda,
-                                        B_rowmajor_buffer.data(), ldb_rowmajor,
-                                        C_rowmajor_buffer.data(), ldc_rowmajor);
-
-    // 4. Transpose the row-major result back to the application's column-major buffer.
-    transpose_f32_row_to_col(C_rowmajor_buffer.data(), C_colmajor, m, n, ldc_colmajor);
-}
-
-
 
 
 /**
@@ -2949,7 +2955,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             int64_t ldb_colmajor = k;
             for (int64_t j = 0; j < n; ++j) {
                 for (int64_t i = 0; i < k; ++i) {
-                    B_colmajor[j * ldb_colmajor + i] = ((const ggml_bf16_t*)B)[j * ldb + i];
+                    B_colmajor[j * ldb_colmajor + i] = ((const ggml_bf16_t*)B)[i * ldb + j];
                 }
             }
 
@@ -2964,14 +2970,24 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
 
             auto ret = tb.matmul(m, n);
 
+
+
+
             // Allocate col-major buffer for zendnn result.
             std::vector<float> C_colmajor(n * m);
             int64_t ldc_colmajor = m;
-
-            // Compute using zendnn_sgemm_bf16_pure_rowmajor.
-            zendnn_sgemm_bf16_pure_rowmajor(m, n, k,
-                                            A_dense.data(), k,
-                                            B_colmajor.data(), ldb_colmajor,
+            int64_t lda_rowmajor = k;
+            int64_t lda_colmajor = m;
+            int64_t ldb_colmajor = k;
+            
+            memory::format_tag tags[2] = {memory::format_tag::ab, memory::format_tag::ba};
+            memory::format_tag src_tag = tags[1];// ba  column major
+            memory::format_tag weights_tag = tags[0]; //ab column  major
+            memory::format_tag dst_tag = tags[1];  // ba  column major
+            zendnn_sgemm_bf16_with_formats(src_tag, weights_tag, dst_tag,
+                                            m, n, k,
+                                            (const ggml_bf16_t*)A, lda_colmajor,
+                                            (const ggml_bf16_t*)B, ldb_colmajor,
                                             C_colmajor.data(), ldc_colmajor);
 
             // Compare original C (row-major with ldc) with C_colmajor (col-major with ldc_colmajor).
@@ -2986,76 +3002,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
                 }
             }
 
-            double total_elements = static_cast<double>(m) * n;
-            double accuracy = 100.0 * static_cast<double>(count_good) / total_elements;
-            std::cout<<"Accuracy: "<<accuracy<<"\n";
-            /*
-            // If accuracy < 98%, create dense row-major copies and dump tensors.
-            if (accuracy < 98.0) {
-                // Define transpose function if not already defined.
-                // void transpose_f32_col_to_row(const float* src, float* dst,
-                //                               int64_t rows, int64_t cols, int64_t ld_src, int64_t ld_dst) {
-                //     for (int64_t c = 0; c < cols; ++c) {
-                //         for (int64_t r = 0; r < rows; ++r) {
-                //             dst[r * ld_dst + c] = src[c * ld_src + r];
-                //         }
-                //     }
-                // }
-
-                // Deep copy B to dense row-major for dumping.
-                std::vector<ggml_bf16_t> B_dense(k * n);
-                for (int64_t i = 0; i < k; ++i) {
-                    for (int64_t j = 0; j < n; ++j) {
-                        B_dense[i * n + j] = ((const ggml_bf16_t*)B)[i * ldb + j];
-                    }
-                }
-
-                // Deep copy original C (tinyBLAS) to dense row-major for dumping.
-                std::vector<float> C_tiny_dense(m * n);
-                for (int64_t i = 0; i < m; ++i) {
-                    for (int64_t j = 0; j < n; ++j) {
-                        C_tiny_dense[i * n + j] = ((const float*)C)[i * ldc + j];
-                    }
-                }
-
-                // Transpose C_colmajor to dense row-major for dumping.
-                std::vector<float> C_zendnn_dense(m * n);
-                transpose_f32_col_to_row(C_colmajor.data(), C_zendnn_dense.data(), m, n, ldc_colmajor, n);
-
-                // Dump A_dense
-                {
-                    FILE* f = fopen("A_dump.bin", "wb");
-                    if (f) {
-                        fwrite(A_dense.data(), sizeof(ggml_bf16_t), m * k, f);
-                        fclose(f);
-                    }
-                }
-                // Dump B_dense (row-major)
-                {
-                    FILE* f = fopen("B_dump.bin", "wb");
-                    if (f) {
-                        fwrite(B_dense.data(), sizeof(ggml_bf16_t), k * n, f);
-                        fclose(f);
-                    }
-                }
-                // Dump C_tiny_dense (tinyBLAS result)
-                {
-                    FILE* f = fopen("C1_dump.bin", "wb");
-                    if (f) {
-                        fwrite(C_tiny_dense.data(), sizeof(float), m * n, f);
-                        fclose(f);
-                    }
-                }
-                // Dump C_zendnn_dense (zendnn result, transposed to row-major)
-                {
-                    FILE* f = fopen("C2_dump.bin", "wb");
-                    if (f) {
-                        fwrite(C_zendnn_dense.data(), sizeof(float), m * n, f);
-                        fclose(f);
-                    }
-                }
-            }*/
-
+            
+            static int64_t tensor_number = 1;
+            if(tensor_number<=10){
+                double total_elements = static_cast<double>(m) * n;
+                double accuracy = 100.0 * static_cast<double>(count_good) / total_elements;
+                std::cout << " Accuracy of Tensor " <<tensor_number++<< " " << accuracy << "%\n";
+            }
+                    
             return ret;
         }
 #elif defined(__AVX512F__)

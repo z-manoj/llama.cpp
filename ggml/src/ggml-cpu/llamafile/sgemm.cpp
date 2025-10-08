@@ -2959,6 +2959,9 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     case GGML_TYPE_BF16: {
 #if defined(__AVX512BF16__)
         if (Btype == GGML_TYPE_BF16) {
+            
+            // Allocate col-major buffer for zendnn result.
+            std::vector<float> C_colmajor(n * m,0.0f);
         // --- Step 1: Run tinyBLAS (baseline) ---
             tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{
                 params, k,

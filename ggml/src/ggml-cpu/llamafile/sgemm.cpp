@@ -2989,7 +2989,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             memory::format_tag tags[2] = {memory::format_tag::ab, memory::format_tag::ba};
             memory::format_tag src_tag = tags[1];//ba
             memory::format_tag weights_tag = tags[0];//ab
-            memory::format_tag dst_tag = tags[0];//ba
+            memory::format_tag dst_tag = tags[0];//ab
             zendnn_sgemm_bf16_with_formats(src_tag, weights_tag, dst_tag,
                                             m, n, k,
                                             (const ggml_bf16_t*)A, lda_colmajor,

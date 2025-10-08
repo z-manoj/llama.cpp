@@ -2650,7 +2650,7 @@ void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
                        const ggml_bf16_t* A, int64_t lda,
                        const ggml_bf16_t* B, int64_t ldb,
                        float* C, int64_t ldc,
-                       const struct ggml_compute_params * ) {
+                       const struct ggml_compute_params * params ) {
     // Dynamically set OpenMP threads to match params->nth
     omp_set_num_threads(1);
 
@@ -2664,9 +2664,9 @@ void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
 
 
     // Layouts: A row-major, B col-major, C col-major
-    memory::desc src_md(src_dims, memory::data_type::bf16, {lda, 1});  // ab with strides
-    memory::desc weights_md(weights_dims, memory::data_type::bf16, {1, ldb});  // ba with strides
-    memory::desc dst_md(dst_dims, memory::data_type::f32, {1, ldc});  // ba with strides
+    memory::desc src_md(src_dims, memory::data_type::bf16, memory::format_tag::ab);  // ab with strides
+    memory::desc weights_md(weights_dims, memory::data_type::bf16, memory::format_tag::ba);  // ba with strides
+    memory::desc dst_md(dst_dims, memory::data_type::f32, memory::format_tag::ba);  // ba with strides
     
     memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(A));
     memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(B));
@@ -2761,6 +2761,11 @@ void transpose_f32_row_to_col(const float* src, float* dst,
 
 
 
+
+
+
+
+
 //      --------------      Trying Layouts       ----------------
 
 void zendnn_sgemm_bf16_with_formats(memory::format_tag src_tag, memory::format_tag weights_tag, memory::format_tag dst_tag,
@@ -2780,22 +2785,22 @@ void zendnn_sgemm_bf16_with_formats(memory::format_tag src_tag, memory::format_t
     memory::desc dst_md(dst_dims, memory::data_type::f32, dst_tag);
 
     // Prepare A buffer if needed
-    std::vector<ggml_bf16_t> A_buffer;
+    // std::vector<ggml_bf16_t> A_buffer;
     ggml_bf16_t* A_ptr = const_cast<ggml_bf16_t*>(A_orig_rowmajor);
-    if (src_tag == memory::format_tag::ba) {
-        A_buffer.resize(m * k);
-        transpose_bf16_row_to_col(A_orig_rowmajor, A_buffer.data(), m, k, m);  // ldd = m for col-major
-        A_ptr = A_buffer.data();
-    }
+    // if (src_tag == memory::format_tag::ba) {
+    //     A_buffer.resize(m * k);
+    //     transpose_bf16_row_to_col(A_orig_rowmajor, A_buffer.data(), m, k, m);  // ldd = m for col-major
+    //     A_ptr = A_buffer.data();
+    // }
 
     // Prepare B buffer if needed
-    std::vector<ggml_bf16_t> B_buffer;
+    // std::vector<ggml_bf16_t> B_buffer;
     ggml_bf16_t* B_ptr = const_cast<ggml_bf16_t*>(B_orig_colmajor);
-    if (weights_tag == memory::format_tag::ab) {
-        B_buffer.resize(k * n);
-        transpose_bf16_col_to_row(B_orig_colmajor, B_buffer.data(), k, n, k);  // lds = k for col-major src
-        B_ptr = B_buffer.data();
-    }
+    // if (weights_tag == memory::format_tag::ab) {
+    //     B_buffer.resize(k * n);
+    //     transpose_bf16_col_to_row(B_orig_colmajor, B_buffer.data(), k, n, k);  // lds = k for col-major src
+    //     B_ptr = B_buffer.data();
+    // }
 
     // Allocate C buffer
     std::vector<float> C_buffer(m * n);
@@ -2837,6 +2842,19 @@ void zendnn_sgemm_bf16_with_formats(memory::format_tag src_tag, memory::format_t
         // dst is row-major, transpose to col-major
         transpose_f32_row_to_col(C_buffer.data(), C_out_colmajor, m, n, ldc_colmajor);
     }
+}
+
+
+
+double calculate_accuracy(const std::vector<float>& computed, const std::vector<float>& expected, double tol = 1e-4) {
+    if (computed.size() != expected.size() || computed.empty()) return 0.0;
+    int match_count = 0;
+    for (size_t i = 0; i < computed.size(); ++i) {
+        if (std::abs(computed[i] - expected[i]) < tol) {
+            match_count++;
+        }
+    }
+    return (static_cast<double>(match_count) / computed.size()) * 100.0;
 }
 
 
@@ -2941,26 +2959,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     case GGML_TYPE_BF16: {
 #if defined(__AVX512BF16__)
         if (Btype == GGML_TYPE_BF16) {
-
-            // Deep copy A to dense row-major buffer.
-            std::vector<ggml_bf16_t> A_dense(m * k);
-            for (int64_t i = 0; i < m; ++i) {
-                for (int64_t j = 0; j < k; ++j) {
-                    A_dense[i * k + j] = ((const ggml_bf16_t*)A)[i * lda + j];
-                }
-            }
-
-            // Deep copy B to dense col-major buffer.
-            std::vector<ggml_bf16_t> B_colmajor(n * k);
-            int64_t ldb_colmajor = k;
-            for (int64_t j = 0; j < n; ++j) {
-                for (int64_t i = 0; i < k; ++i) {
-                    B_colmajor[j * ldb_colmajor + i] = ((const ggml_bf16_t*)B)[i * ldb + j];
-                }
-            }
-
-
-                // --- Step 1: Run tinyBLAS (baseline) ---
+        // --- Step 1: Run tinyBLAS (baseline) ---
             tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{
                 params, k,
                 (const ggml_bf16_t*)A, lda,
@@ -2973,42 +2972,45 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
 
 
 
-            // Allocate col-major buffer for zendnn result.
-            std::vector<float> C_colmajor(n * m);
-            int64_t ldc_colmajor = m;
+            int64_t ldb_colmajor = k;
+            int64_t ldb_rowmajor = n;
+
             int64_t lda_rowmajor = k;
             int64_t lda_colmajor = m;
-            int64_t ldb_colmajor = k;
+            
+            int64_t ldc_rowmajor = n;
+            int64_t ldc_colmajor = m;
+
+
             
             memory::format_tag tags[2] = {memory::format_tag::ab, memory::format_tag::ba};
-            memory::format_tag src_tag = tags[1];// ba  column major
-            memory::format_tag weights_tag = tags[0]; //ab column  major
-            memory::format_tag dst_tag = tags[1];  // ba  column major
+            memory::format_tag src_tag = tags[1];//ba
+            memory::format_tag weights_tag = tags[0];//ab
+            memory::format_tag dst_tag = tags[0];//ba
             zendnn_sgemm_bf16_with_formats(src_tag, weights_tag, dst_tag,
                                             m, n, k,
                                             (const ggml_bf16_t*)A, lda_colmajor,
-                                            (const ggml_bf16_t*)B, ldb_colmajor,
-                                            C_colmajor.data(), ldc_colmajor);
+                                            (const ggml_bf16_t*)B, ldb_rowmajor,
+                                            C_colmajor.data(), ldc_rowmajor);
 
-            // Compare original C (row-major with ldc) with C_colmajor (col-major with ldc_colmajor).
-            int64_t count_good = 0;
+
+            std::vector<float> expected(m * n);
             for (int64_t i = 0; i < m; ++i) {
                 for (int64_t j = 0; j < n; ++j) {
-                    float v1 = ((const float*)C)[i * ldc + j];
-                    float v2 = C_colmajor[j * ldc_colmajor + i];
-                    if (std::fabs(v1 - v2) < 1e-3f) {
-                        ++count_good;
-                    }
+                    expected[i * n + j] = ((const float*)C)[i * ldc + j];
                 }
             }
 
-            
-            static int64_t tensor_number = 1;
-            if(tensor_number<=10){
-                double total_elements = static_cast<double>(m) * n;
-                double accuracy = 100.0 * static_cast<double>(count_good) / total_elements;
-                std::cout << " Accuracy of Tensor " <<tensor_number++<< " " << accuracy << "%\n";
+            std::vector<float> computed(m * n);
+            for (int64_t i = 0; i < m; ++i) {
+                for (int64_t j = 0; j < n; ++j) {
+                    computed[i * n + j] = C_colmajor[j * ldc + i];
+                }
             }
+
+            // double total_elements = static_cast<double>(m) * n;
+            double accuracy = calculate_accuracy(computed,expected);
+            std::cout << " Accuracy: " << accuracy << "%\n";
                     
             return ret;
         }

@@ -2637,49 +2637,39 @@ class tinyBLAS_PPC {
 } // namespace
 
 
+#include <omp.h>
+using namespace zendnn; // Include OpenMP for dynamic thread control
 
-
-#include<omp.h>
-using namespace zendnn;// Include OpenMP for dynamic thread control
-
-
-
-//      --------------              WORKING CODE        ----------------
-// Updated ZendNN function with static engine/stream for reuse
 void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
-                       const ggml_bf16_t* A, int64_t lda,
-                       const ggml_bf16_t* B, int64_t ldb,
+                       const ggml_bf16_t* weights, int64_t lda,
+                       const ggml_bf16_t* src, int64_t ldb,
                        float* C, int64_t ldc,
-                       const struct ggml_compute_params * params ) {
-    // Dynamically set OpenMP threads to match params->nth
+                       int nth) {
     omp_set_num_threads(1);
 
-    // Static engine and stream: Created once on first call, reused thereafter
     static engine eng(engine::kind::cpu, 0);
     static stream s(eng);
 
-    memory::dims src_dims     = {m, k};
-    memory::dims weights_dims = {k, n};
-    memory::dims dst_dims     = {m, n};
+    memory::dims src_dims     = {n, k};
+    memory::dims weights_dims = {k, m};
+    memory::dims dst_dims     = {n, m};
 
+    memory::desc src_md(src_dims, memory::data_type::bf16, memory::format_tag::ab);
+    memory::desc weights_md(weights_dims, memory::data_type::bf16, memory::format_tag::ba);
+    memory::desc dst_md(dst_dims, memory::data_type::f32, memory::format_tag::ab);
 
-    // Layouts: A row-major, B col-major, C col-major
-    memory::desc src_md(src_dims, memory::data_type::bf16, memory::format_tag::ab);  // ab with strides
-    memory::desc weights_md(weights_dims, memory::data_type::bf16, memory::format_tag::ba);  // ba with strides
-    memory::desc dst_md(dst_dims, memory::data_type::f32, memory::format_tag::ba);  // ba with strides
-    
-    memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(A));
-    memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(B));
-    memory dst_mem(dst_md, eng, C);
+    memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(src));
+    memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(weights));
+    memory dst_mem(dst_md, eng, const_cast<float*>(C));
 
     matmul::desc matmul_d(src_md, weights_md, dst_md);
     matmul::primitive_desc matmul_pd(matmul_d, eng);
     matmul matmul_prim(matmul_pd);
 
-    // Warm-up: Only on first call (use static flag to skip after)
+
     static bool warmed_up = false;
     if (!warmed_up) {
-        std::vector<float> warmup_C(m * ldc, 0.f);
+        std::vector<float> warmup_C(n * m, 0.f);
         memory warmup_mem(dst_md, eng, warmup_C.data());
         for (int i = 0; i < 5; ++i) {
             matmul_prim.execute(s, {
@@ -2691,8 +2681,7 @@ void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
         s.wait();
         warmed_up = true;
     }
-
-    // Final execution (multi-threaded)
+    
     matmul_prim.execute(s, {
         {ZENDNN_ARG_SRC, src_mem},
         {ZENDNN_ARG_WEIGHTS, weights_mem},
@@ -2703,159 +2692,6 @@ void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
 }
 
 
-
-
-
-
-
-//  -----------         Transposing     ------------------
-
-// --- Transposition Logic ---
-
-/**
- * @brief Transposes a BF16 matrix from column-major to row-major layout.
- */
-void transpose_bf16_col_to_row(const ggml_bf16_t* src, ggml_bf16_t* dst,
-                               int64_t num_rows, int64_t num_cols, int64_t lds) {
-    #pragma omp parallel for
-    for (int64_t j = 0; j < num_cols; ++j) {
-        for (int64_t i = 0; i < num_rows; ++i) {
-            // Read from col-major src: src[i + j * lds]
-            // Write to row-major dst:  dst[i * num_cols + j]
-            dst[i * num_cols + j] = src[i + j * lds];
-        }
-    }
-}
-
-/**
- * @brief Transposes a BF16 matrix from row-major to column-major layout.
- */
-void transpose_bf16_row_to_col(const ggml_bf16_t* src, ggml_bf16_t* dst,
-                               int64_t num_rows, int64_t num_cols, int64_t ldd) {
-    #pragma omp parallel for
-    for (int64_t j = 0; j < num_cols; ++j) {
-        for (int64_t i = 0; i < num_rows; ++i) {
-            // Read from row-major src: src[i * num_cols + j]
-            // Write to col-major dst:  dst[i + j * ldd]
-            dst[i + j * ldd] = src[i * num_cols + j];
-        }
-    }
-}
-
-/**
- * @brief Transposes a Float32 matrix from row-major to column-major layout.
- */
-void transpose_f32_row_to_col(const float* src, float* dst,
-                              int64_t num_rows, int64_t num_cols, int64_t ldd) {
-    #pragma omp parallel for
-    for (int64_t j = 0; j < num_cols; ++j) {
-        for (int64_t i = 0; i < num_rows; ++i) {
-            // Read from row-major src: src[i * num_cols + j]
-            // Write to col-major dst:  dst[i + j * ldd]
-            dst[i + j * ldd] = src[i * num_cols + j];
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-//      --------------      Trying Layouts       ----------------
-
-void zendnn_sgemm_bf16_with_formats(memory::format_tag src_tag, memory::format_tag weights_tag, memory::format_tag dst_tag,
-                                    int64_t m, int64_t n, int64_t k,
-                                    const ggml_bf16_t* A_orig_rowmajor, int64_t lda_rowmajor,
-                                    const ggml_bf16_t* B_orig_colmajor, int64_t ldb_colmajor,
-                                    float* C_out_colmajor, int64_t ldc_colmajor) {
-    static engine eng(engine::kind::cpu, 0);
-    static stream s(eng);
-
-    memory::dims src_dims = {m, k};
-    memory::dims weights_dims = {k, n};
-    memory::dims dst_dims = {m, n};
-
-    memory::desc src_md(src_dims, memory::data_type::bf16, src_tag);
-    memory::desc weights_md(weights_dims, memory::data_type::bf16, weights_tag);
-    memory::desc dst_md(dst_dims, memory::data_type::f32, dst_tag);
-
-    // Prepare A buffer if needed
-    // std::vector<ggml_bf16_t> A_buffer;
-    ggml_bf16_t* A_ptr = const_cast<ggml_bf16_t*>(A_orig_rowmajor);
-    // if (src_tag == memory::format_tag::ba) {
-    //     A_buffer.resize(m * k);
-    //     transpose_bf16_row_to_col(A_orig_rowmajor, A_buffer.data(), m, k, m);  // ldd = m for col-major
-    //     A_ptr = A_buffer.data();
-    // }
-
-    // Prepare B buffer if needed
-    // std::vector<ggml_bf16_t> B_buffer;
-    ggml_bf16_t* B_ptr = const_cast<ggml_bf16_t*>(B_orig_colmajor);
-    // if (weights_tag == memory::format_tag::ab) {
-    //     B_buffer.resize(k * n);
-    //     transpose_bf16_col_to_row(B_orig_colmajor, B_buffer.data(), k, n, k);  // lds = k for col-major src
-    //     B_ptr = B_buffer.data();
-    // }
-
-    // Allocate C buffer
-    std::vector<float> C_buffer(m * n);
-    float* C_ptr = C_buffer.data();
-
-    memory src_mem(src_md, eng, A_ptr);
-    memory weights_mem(weights_md, eng, B_ptr);
-    memory dst_mem(dst_md, eng, C_ptr);
-
-    matmul::desc matmul_d(src_md, weights_md, dst_md);
-    matmul::primitive_desc matmul_pd(matmul_d, eng);
-    matmul matmul_prim(matmul_pd);
-
-    // Warm-up
-    std::vector<float> warmup_C(m * n, 0.f);
-    memory warmup_mem(dst_md, eng, warmup_C.data());
-    for (int i = 0; i < 5; ++i) {
-        matmul_prim.execute(s, {
-            {ZENDNN_ARG_SRC, src_mem},
-            {ZENDNN_ARG_WEIGHTS, weights_mem},
-            {ZENDNN_ARG_DST, warmup_mem}
-        });
-    }
-    s.wait();
-
-    // Final execution
-    matmul_prim.execute(s, {
-        {ZENDNN_ARG_SRC, src_mem},
-        {ZENDNN_ARG_WEIGHTS, weights_mem},
-        {ZENDNN_ARG_DST, dst_mem}
-    });
-    s.wait();
-
-    // Convert C to col-major if needed
-    if (dst_tag == memory::format_tag::ba) {
-        // Both col-major
-        std::copy(C_buffer.begin(), C_buffer.end(), C_out_colmajor);
-    } else {
-        // dst is row-major, transpose to col-major
-        transpose_f32_row_to_col(C_buffer.data(), C_out_colmajor, m, n, ldc_colmajor);
-    }
-}
-
-
-
-double calculate_accuracy(const std::vector<float>& computed, const std::vector<float>& expected, double tol = 1e-4) {
-    if (computed.size() != expected.size() || computed.empty()) return 0.0;
-    int match_count = 0;
-    for (size_t i = 0; i < computed.size(); ++i) {
-        if (std::abs(computed[i] - expected[i]) < tol) {
-            match_count++;
-        }
-    }
-    return (static_cast<double>(match_count) / computed.size()) * 100.0;
-}
 
 
 /**
@@ -2891,7 +2727,7 @@ double calculate_accuracy(const std::vector<float>& computed, const std::vector<
 bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64_t n, int64_t k,
                      const void *A, int64_t lda, const void *B, int64_t ldb, void *C,
                      int64_t ldc, int Atype, int Btype, int Ctype) {
-
+                        
     assert(m >= 0);
     assert(n >= 0);
     assert(k >= 0);
@@ -2900,6 +2736,17 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     assert(ldc >= m);
     assert(params->nth > 0);
     assert(params->ith < params->nth);
+
+    // if (Ctype == GGML_TYPE_F32 && Atype == GGML_TYPE_BF16 && Btype == GGML_TYPE_BF16) {
+    //     if(params->ith==0)
+    //         zendnn_sgemm_bf16(m, n, k, (const ggml_bf16_t*)A, lda, (const ggml_bf16_t*)B, ldb, (float*)C, ldc, params->nth);
+    //     return true;
+    // }
+
+    // // Add other cases or fallback logic here if needed
+    // return false;
+
+
 #if !defined(__MMA__)
     if (n < 2)
         return false;
@@ -2959,63 +2806,24 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     case GGML_TYPE_BF16: {
 #if defined(__AVX512BF16__)
         if (Btype == GGML_TYPE_BF16) {
+            // tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{
+            //     params, k,
+            //     (const ggml_bf16_t*)A, lda,
+            //     (const ggml_bf16_t*)B, ldb,
+            //     (float*)C, ldc
+            // };
+
+            // auto ret = tb.matmul(m, n);
             
-            // Allocate col-major buffer for zendnn result.
-            std::vector<float> C_colmajor(n * m,0.0f);
-        // --- Step 1: Run tinyBLAS (baseline) ---
-            tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{
-                params, k,
-                (const ggml_bf16_t*)A, lda,
-                (const ggml_bf16_t*)B, ldb,
-                (float*)C, ldc
-            };
-
-            auto ret = tb.matmul(m, n);
-
-
-
-
-            int64_t ldb_colmajor = k;
-            int64_t ldb_rowmajor = n;
-
-            int64_t lda_rowmajor = k;
-            int64_t lda_colmajor = m;
+            // return ret;
             
-            int64_t ldc_rowmajor = n;
-            int64_t ldc_colmajor = m;
-
-
             
-            memory::format_tag tags[2] = {memory::format_tag::ab, memory::format_tag::ba};
-            memory::format_tag src_tag = tags[1];//ba
-            memory::format_tag weights_tag = tags[0];//ab
-            memory::format_tag dst_tag = tags[0];//ab
-            zendnn_sgemm_bf16_with_formats(src_tag, weights_tag, dst_tag,
-                                            m, n, k,
-                                            (const ggml_bf16_t*)A, lda_colmajor,
-                                            (const ggml_bf16_t*)B, ldb_rowmajor,
-                                            C_colmajor.data(), ldc_rowmajor);
-
-
-            std::vector<float> expected(m * n);
-            for (int64_t i = 0; i < m; ++i) {
-                for (int64_t j = 0; j < n; ++j) {
-                    expected[i * n + j] = ((const float*)C)[i * ldc + j];
-                }
+            if(params->ith==0){
+                zendnn_sgemm_bf16(m, n, k, (const ggml_bf16_t*)A, lda, (const ggml_bf16_t*)B, ldb, (float*)C, ldc, params->nth);
+                return true;
             }
+            return false;
 
-            std::vector<float> computed(m * n);
-            for (int64_t i = 0; i < m; ++i) {
-                for (int64_t j = 0; j < n; ++j) {
-                    computed[i * n + j] = C_colmajor[j * ldc + i];
-                }
-            }
-
-            // double total_elements = static_cast<double>(m) * n;
-            double accuracy = calculate_accuracy(computed,expected);
-            std::cout << " Accuracy: " << accuracy << "%\n";
-                    
-            return ret;
         }
 #elif defined(__AVX512F__)
         if (Btype == GGML_TYPE_BF16) {

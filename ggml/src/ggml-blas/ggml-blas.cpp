@@ -5,6 +5,8 @@
 #include <future>
 #include <vector>
 #include <cstring>
+#include "zendnn.hpp"
+#include "ggml-cpu.h" 
 
 #if defined(GGML_BLAS_USE_ACCELERATE)
 #   include <Accelerate/Accelerate.h>
@@ -26,6 +28,41 @@ struct ggml_backend_blas_context {
     std::vector<std::future<void>> tasks;
 #endif
 };
+
+using namespace zendnn;
+static void zendnn_sgemm_bf16(
+    int64_t m, int64_t n, int64_t k,
+    const ggml_bf16_t* weights,
+    const ggml_bf16_t* src,
+    float* C)
+{
+    static engine eng(engine::kind::cpu, 0);
+    static stream s(eng);
+
+    memory::dims src_dims     = {n, k};
+    memory::dims weights_dims = {k, m};
+    memory::dims dst_dims     = {n, m};
+
+    memory::desc src_md(src_dims, memory::data_type::bf16, memory::format_tag::ab);
+    memory::desc weights_md(weights_dims, memory::data_type::bf16, memory::format_tag::ba);
+    memory::desc dst_md(dst_dims, memory::data_type::f32, memory::format_tag::ab);
+
+    memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(src));
+    memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(weights));
+    memory dst_mem(dst_md, eng, C);
+    
+    matmul::desc matmul_d(src_md, weights_md, dst_md);
+    matmul::primitive_desc matmul_pd(matmul_d, eng);
+    matmul matmul_prim(matmul_pd);
+    
+    matmul_prim.execute(s, {
+        {ZENDNN_ARG_SRC, src_mem},
+        {ZENDNN_ARG_WEIGHTS, weights_mem},
+        {ZENDNN_ARG_DST, dst_mem}
+    });
+
+    s.wait();
+} 
 
 static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
@@ -126,6 +163,33 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
 #if defined(GGML_BLAS_USE_NVPL)
     nvpl_blas_set_num_threads(ctx->n_threads);
 #endif
+
+    for (int64_t i13 = 0; i13 < ne13; i13++)  
+        for (int64_t i12 = 0; i12 < ne12; i12++) {  
+            const char * base0 = (const char*)src0->data + (i12/r2)*nb02 + (i13/r3)*nb03;  
+            const char * base1 = (const char*)src1->data + i12*nb12 + i13*nb13;  
+            char * baseDst = (char*)dst->data + i12*nb2 + i13*nb3;  
+    
+            const ggml_bf16_t * ptr0 = reinterpret_cast<const ggml_bf16_t*>(base0);  
+            float * ptrDst = reinterpret_cast<float*>(baseDst);  
+    
+            // Convert the CURRENT batch slice from F32 to BF16 
+            auto start = std::chrono::high_resolution_clock::now(); 
+            ggml_cpu_fp32_to_bf16(  
+                (const float*)base1,           // Source: current batch slice  
+                (ggml_bf16_t*)wdata,           // Destination: work buffer  
+                ne10 * ne11                    // Number of elements  
+            );  
+            zendnn_sgemm_bf16(  
+                ne01,                          // m  
+                ne11,                          // n  
+                ne10,                          // k  
+                ptr0,                          // BF16 weights  
+                (const ggml_bf16_t*)wdata,     // Converted BF16 activations  
+                ptrDst                         // Output  
+            );  
+        }
+    return;
 
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {

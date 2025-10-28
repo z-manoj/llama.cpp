@@ -53,10 +53,9 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "simd-mappings.h"
-#include "zendnn.hpp"
 #include <array>
 #include <type_traits>
-
+#include "zendnn.hpp"
 #ifdef _MSC_VER
 #define NOINLINE __declspec(noinline)
 #else
@@ -2637,60 +2636,93 @@ class tinyBLAS_PPC {
 } // namespace
 
 
-#include <omp.h>
-using namespace zendnn; // Include OpenMP for dynamic thread control
 
-void zendnn_sgemm_bf16(int64_t m, int64_t n, int64_t k,
-                       const ggml_bf16_t* weights, int64_t lda,
-                       const ggml_bf16_t* src, int64_t ldb,
-                       float* C, int64_t ldc,
-                       int nth) {
-    omp_set_num_threads(1);
+#include<cstdlib>
+#include<omp.h>
+using namespace zendnn;// Include OpenMP for dynamic thread control
 
+
+static inline void zendnn_set_single_thread_mode() {
+    // Force ZendNN / oneDNN to use only 1 internal thread
+    setenv("OMP_NUM_THREADS", "1", 1);
+    setenv("ZENDNN_INNER_THREADS", "1", 1);
+    setenv("ZENDNN_NUM_THREADS", "1", 1);
+    // Optional: best ISA hint for AVX-512 BF16 CPUs
+    setenv("DNNL_MAX_CPU_ISA", "AVX512_CORE_BF16", 1);
+}
+
+// -----------------------------------------------------------------------------
+// Threaded BF16 GEMM: each GGML thread computes its own slice of rows in C
+// -----------------------------------------------------------------------------
+void zendnn_sgemm_bf16_threaded(
+    const ggml_compute_params *params,
+    int64_t m, int64_t n, int64_t k,
+    const ggml_bf16_t *weights, int64_t lda,   // B: (k × m)
+    const ggml_bf16_t *src,     int64_t ldb,   // A: (n × k)
+    float *C,                   int64_t ldc)   // C: (n × m)
+{
+    GGML_ASSERT(params);
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
+
+    // --- ensure thread-safe init
+    if (ith == 0) {
+        zendnn_set_single_thread_mode();  // disable internal ZendNN threading
+        ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+    ggml_barrier(params->threadpool);
+
+    // -------------------------------------------------------------------------
+    // Divide rows of C (and corresponding rows of A) among threads
+    // Each thread computes rows [row0, row1) of output matrix
+    // -------------------------------------------------------------------------
+    const int64_t row0 = (n *  ith     ) / nth;
+    const int64_t row1 = (n * (ith + 1)) / nth;
+    const int64_t n_local = row1 - row0;
+    if (n_local <= 0) {
+        ggml_barrier(params->threadpool);
+        return;
+    }
+
+    // --- oneDNN / ZendNN engine per thread
     static engine eng(engine::kind::cpu, 0);
-    static stream s(eng);
+    stream s(eng);
 
-    memory::dims src_dims     = {n, k};
+    // Local sub-matrix shapes for this thread
+    memory::dims src_dims     = {n_local, k};  // rows of A for this thread
     memory::dims weights_dims = {k, m};
-    memory::dims dst_dims     = {n, m};
+    memory::dims dst_dims     = {n_local, m};
 
+    // Same layout as your original wrapper
     memory::desc src_md(src_dims, memory::data_type::bf16, memory::format_tag::ab);
     memory::desc weights_md(weights_dims, memory::data_type::bf16, memory::format_tag::ba);
-    memory::desc dst_md(dst_dims, memory::data_type::f32, memory::format_tag::ab);
+    memory::desc dst_md(dst_dims, memory::data_type::f32,  memory::format_tag::ab);
 
-    memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(src));
+    // Offsets into full matrices
+    const ggml_bf16_t *src_local = src + row0 * ldb;  // A slice
+    float *C_local = C + row0 * ldc;                  // C slice (same rows)
+
+    // Create memory objects
+    memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(src_local));
     memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(weights));
-    memory dst_mem(dst_md, eng, const_cast<float*>(C));
+    memory dst_mem(dst_md, eng, C_local);
 
+    // oneDNN MatMul descriptor
     matmul::desc matmul_d(src_md, weights_md, dst_md);
     matmul::primitive_desc matmul_pd(matmul_d, eng);
     matmul matmul_prim(matmul_pd);
 
-
-    static bool warmed_up = false;
-    if (!warmed_up) {
-        std::vector<float> warmup_C(n * m, 0.f);
-        memory warmup_mem(dst_md, eng, warmup_C.data());
-        for (int i = 0; i < 5; ++i) {
-            matmul_prim.execute(s, {
-                {ZENDNN_ARG_SRC, src_mem},
-                {ZENDNN_ARG_WEIGHTS, weights_mem},
-                {ZENDNN_ARG_DST, warmup_mem}
-            });
-        }
-        s.wait();
-        warmed_up = true;
-    }
-    
+    // Execute only this thread’s submatrix
     matmul_prim.execute(s, {
-        {ZENDNN_ARG_SRC, src_mem},
+        {ZENDNN_ARG_SRC,     src_mem},
         {ZENDNN_ARG_WEIGHTS, weights_mem},
-        {ZENDNN_ARG_DST, dst_mem}
+        {ZENDNN_ARG_DST,     dst_mem}
     });
-
     s.wait();
-}
 
+    ggml_barrier(params->threadpool);
+}
 
 
 
@@ -2736,17 +2768,6 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     assert(ldc >= m);
     assert(params->nth > 0);
     assert(params->ith < params->nth);
-
-    // if (Ctype == GGML_TYPE_F32 && Atype == GGML_TYPE_BF16 && Btype == GGML_TYPE_BF16) {
-    //     if(params->ith==0)
-    //         zendnn_sgemm_bf16(m, n, k, (const ggml_bf16_t*)A, lda, (const ggml_bf16_t*)B, ldb, (float*)C, ldc, params->nth);
-    //     return true;
-    // }
-
-    // // Add other cases or fallback logic here if needed
-    // return false;
-
-
 #if !defined(__MMA__)
     if (n < 2)
         return false;
@@ -2806,6 +2827,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     case GGML_TYPE_BF16: {
 #if defined(__AVX512BF16__)
         if (Btype == GGML_TYPE_BF16) {
+            
             // tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{
             //     params, k,
             //     (const ggml_bf16_t*)A, lda,
@@ -2814,15 +2836,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             // };
 
             // auto ret = tb.matmul(m, n);
-            
-            // return ret;
-            
-            
-            if(params->ith==0){
-                zendnn_sgemm_bf16(m, n, k, (const ggml_bf16_t*)A, lda, (const ggml_bf16_t*)B, ldb, (float*)C, ldc, params->nth);
-                return true;
-            }
-            return false;
+            zendnn_sgemm_bf16_threaded(params,
+                m,n,k,
+                (const ggml_bf16_t*)A, lda,
+                (const ggml_bf16_t*)B, ldb,
+                (float*)C, ldc
+            );
+
+            return true;
 
         }
 #elif defined(__AVX512F__)

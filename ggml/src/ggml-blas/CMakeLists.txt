@@ -1,9 +1,6 @@
 if (GGML_STATIC)
     set(BLA_STATIC ON)
 endif()
-#if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
-#    set(BLA_SIZEOF_INTEGER 8)
-#endif()
 
 set(BLA_VENDOR ${GGML_BLAS_VENDOR})
 find_package(BLAS)
@@ -20,13 +17,10 @@ if (BLAS_FOUND)
         add_compile_definitions(ACCELERATE_LAPACK_ILP64)
         add_compile_definitions(GGML_BLAS_USE_ACCELERATE)
     elseif ("${BLAS_INCLUDE_DIRS}" STREQUAL "")
-        # BLAS_INCLUDE_DIRS is missing in FindBLAS.cmake.
-        # see https://gitlab.kitware.com/cmake/cmake/-/issues/20268
         find_package(PkgConfig REQUIRED)
         if (${GGML_BLAS_VENDOR} MATCHES "Generic")
             pkg_check_modules(DepBLAS blas)
         elseif (${GGML_BLAS_VENDOR} MATCHES "OpenBLAS")
-            # As of openblas v0.3.22, the 64-bit is named openblas64.pc
             pkg_check_modules(DepBLAS openblas64)
             if (NOT DepBLAS_FOUND)
                 pkg_check_modules(DepBLAS openblas)
@@ -40,11 +34,8 @@ if (BLAS_FOUND)
             pkg_check_modules(DepBLAS flexiblas_api)
         elseif (${GGML_BLAS_VENDOR} MATCHES "Intel")
             add_compile_definitions(GGML_BLAS_USE_MKL)
-            # all Intel* libraries share the same include path
             pkg_check_modules(DepBLAS mkl-sdl)
         elseif (${GGML_BLAS_VENDOR} MATCHES "NVHPC")
-            # this doesn't provide pkg-config
-            # suggest to assign BLAS_INCLUDE_DIRS on your own
             if ("${NVHPC_VERSION}" STREQUAL "")
                 message(WARNING "Better to set NVHPC_VERSION")
             else()
@@ -78,8 +69,53 @@ if (BLAS_FOUND)
         add_compile_definitions(GGML_BLAS_USE_MKL)
     endif()
 
-    target_link_libraries     (ggml-blas PRIVATE ${BLAS_LIBRARIES})
+    target_link_libraries(ggml-blas PRIVATE ${BLAS_LIBRARIES})
     target_include_directories(ggml-blas PRIVATE ${BLAS_INCLUDE_DIRS})
+
+    if (GGML_OPENMP)
+        find_package(OpenMP)
+        if (OpenMP_FOUND)
+            message(STATUS "OpenMP found, enabling parallelization for ggml-blas")
+            target_compile_definitions(ggml-blas PRIVATE GGML_USE_OPENMP)
+            target_link_libraries(ggml-blas PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+        else()
+            message(WARNING "OpenMP requested but not found")
+        endif()
+    endif()
+
+    if (GGML_ZENDNN)
+        message(STATUS "Searching for ZenDNN in ${ZENDNN_PATH}")
+        set(ZENDNN_SEARCH_DIRS
+            ${ZENDNN_PATH}
+            ${ZENDNN_PATH}/lib
+            ${ZENDNN_PATH}/build/lib
+            ${ZENDNN_PATH}/build_Release/lib
+            ${ZENDNN_PATH}/build/Linux-x86_64-Release/lib
+            ${ZENDNN_PATH}/_out
+            ${ZENDNN_PATH}/_out/lib
+        )
+        find_library(ZENDNN_LIBRARY
+            NAMES amdZenDNN ZenDNN
+            PATHS ${ZENDNN_SEARCH_DIRS}
+            NO_DEFAULT_PATH
+        )
+        find_path(ZENDNN_INCLUDE_DIR
+            NAMES zendnn.hpp
+            PATHS ${ZENDNN_PATH}/include ${ZENDNN_PATH}/inc
+            NO_DEFAULT_PATH
+        )
+        if (ZENDNN_LIBRARY AND ZENDNN_INCLUDE_DIR)
+            message(STATUS "Found ZenDNN library: ${ZENDNN_LIBRARY}")
+            message(STATUS "Found ZenDNN headers: ${ZENDNN_INCLUDE_DIR}")
+            target_link_libraries(ggml-blas PRIVATE ${ZENDNN_LIBRARY})
+            target_include_directories(ggml-blas PRIVATE ${ZENDNN_INCLUDE_DIR})
+            target_compile_definitions(ggml-blas PRIVATE GGML_USE_ZENDNN)
+        else()
+            message(WARNING "ZenDNN requested but not found in ${ZENDNN_PATH}")
+            message(WARNING "  Library: ${ZENDNN_LIBRARY}")
+            message(WARNING "  Include: ${ZENDNN_INCLUDE_DIR}")
+        endif()
+    endif()
 else()
     message(FATAL_ERROR "BLAS not found, please refer to "
                         "https://cmake.org/cmake/help/latest/module/FindBLAS.html#blas-lapack-vendors"

@@ -6,6 +6,9 @@
 #include <vector>
 #include <cstring>
 
+#include "zendnn.hpp"
+#include "ggml-cpu.h"
+
 #if defined(GGML_BLAS_USE_ACCELERATE)
 #   include <Accelerate/Accelerate.h>
 #elif defined(GGML_BLAS_USE_MKL)
@@ -27,35 +30,62 @@ struct ggml_backend_blas_context {
 #endif
 };
 
-static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct ggml_tensor * dst) {
+using namespace zendnn;
+
+static void zendnn_sgemm_bf16(
+    int64_t m, int64_t n, int64_t k,
+    const ggml_bf16_t* weights,
+    const ggml_bf16_t* src,
+    float* C)
+{
+    static engine eng(engine::kind::cpu, 0);
+    static stream s(eng);
+
+    memory::dims src_dims     = {n, k};
+    memory::dims weights_dims = {k, m};
+    memory::dims dst_dims     = {n, m};
+
+    memory::desc src_md(src_dims, memory::data_type::bf16, memory::format_tag::ab);
+    memory::desc weights_md(weights_dims, memory::data_type::bf16, memory::format_tag::ba);
+    memory::desc dst_md(dst_dims, memory::data_type::f32, memory::format_tag::ab);
+
+    memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(src));
+    memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(weights));
+    memory dst_mem(dst_md, eng, C);
+    
+    matmul::desc matmul_d(src_md, weights_md, dst_md);
+    matmul::primitive_desc matmul_pd(matmul_d, eng);
+    matmul matmul_prim(matmul_pd);
+    
+    matmul_prim.execute(s, {
+        {ZENDNN_ARG_SRC, src_mem},
+        {ZENDNN_ARG_WEIGHTS, weights_mem},
+        {ZENDNN_ARG_DST, dst_mem}
+    });
+
+    s.wait();
+}
+
+
+static void ggml_backend_zendnn_mul_mat(ggml_backend_blas_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const enum ggml_type type = src0->type;
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
 
-    GGML_ASSERT(ne0 == ne01);
-    GGML_ASSERT(ne1 == ne11);
-    GGML_ASSERT(ne2 == ne12);
-    GGML_ASSERT(ne3 == ne13);
+    const enum ggml_type vec_dot_type = GGML_TYPE_BF16;
+    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
 
-    // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(type));
-    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+    const size_t nbw0 = ggml_type_size(vec_dot_type);
+    const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+    const size_t nbw2 = nbw1 * ne11;
+    const size_t nbw3 = nbw2 * ne12;
 
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
-
-    // broadcast factors
-    const int64_t r2 = ne12/ne02;
-    const int64_t r3 = ne13/ne03;
-
-    const int64_t ne_plane      = ne01*ne00;
-    const size_t  desired_wsize = type == GGML_TYPE_F32 ? 0 : ne03*ne02*ne_plane*sizeof(float);
+    const size_t desired_wsize = ne13 * nbw3;
 
     if (ctx->work_size < desired_wsize) {
         ctx->work_data.reset(new char[desired_wsize]);
@@ -63,88 +93,33 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
     }
     void * wdata = ctx->work_data.get();
 
-    // convert src0 to float
-    if (type != GGML_TYPE_F32) {
-        const auto * type_traits = ggml_get_type_traits(type);
-        ggml_to_float_t const to_float = type_traits->to_float;
-
-        for (int64_t i03 = 0; i03 < ne03; i03++) {
-            for (int64_t i02 = 0; i02 < ne02; i02++) {
-                const void  *       x      = (char *)  src0->data + i02*nb02          + i03*nb03;
-                      float * const wplane = (float *) wdata      + i02*ne_plane      + i03*ne02*ne_plane;
-
-                const int min_cols_per_thread = 4096;
-                const int min_rows_per_thread = std::max((int)(min_cols_per_thread/ne00), 1);
-                const int n_threads = std::max(std::min(ctx->n_threads, (int)(ne01/min_rows_per_thread)), 1);
-
-#ifdef GGML_USE_OPENMP
-                #pragma omp parallel for num_threads(n_threads)
-                for (int64_t i01 = 0; i01 < ne01; i01++) {
-                    to_float((const char *) x + i01*nb01, wplane + i01*ne00, ne00);
+    if (src1->type == GGML_TYPE_F32) {
+        #pragma omp parallel for collapse(3) num_threads(ctx->n_threads)
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    int64_t num_elems = ne10;
+                    const float * src_ptr = (const float *)((char *) src1->data +
+                                                            i13 * nb13 + i12 * nb12 + i11 * nb11);
+                    ggml_bf16_t * dst_ptr = (ggml_bf16_t *)((char *) wdata +
+                                                            i13 * nbw3 + i12 * nbw2 + i11 * nbw1);
+                    ggml_fp32_to_bf16_row(src_ptr, dst_ptr, num_elems);
                 }
-#else
-                for (int i = 1; i < n_threads; i++) {
-                    const int64_t start =       i*ne01/n_threads;
-                    const int64_t end   = (i + 1)*ne01/n_threads;
-                    if (start < end) {
-                        ctx->tasks.push_back(std::async(std::launch::async, [=]() {
-                            for (int64_t i01 = start; i01 < end; i01++) {
-                                to_float((const char *) x + i01*nb01, wplane + i01*ne00, ne00);
-                            }
-                        }));
-                    }
-                }
-                {
-                    // reuse the current thread for the first task
-                    const int64_t start = 0;
-                    const int64_t end   = ne01/n_threads;
-                    for (int64_t i01 = start; i01 < end; i01++) {
-                        to_float((const char *) x + i01*nb01, wplane + i01*ne00, ne00);
-                    }
-                }
-#endif
             }
         }
-
-#ifndef GGML_USE_OPENMP
-        // wait for all tasks to finish
-        for (auto & task : ctx->tasks) {
-            task.get();
-        }
-        ctx->tasks.clear();
-#endif
     }
-
-#if defined(OPENBLAS_VERSION)
-    openblas_set_num_threads(ctx->n_threads);
-#endif
-
-#if defined(GGML_BLAS_USE_BLIS)
-    bli_thread_set_num_threads(ctx->n_threads);
-#endif
-
-#if defined(GGML_BLAS_USE_NVPL)
-    nvpl_blas_set_num_threads(ctx->n_threads);
-#endif
 
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
-            const int64_t i03 = i13/r3;
-            const int64_t i02 = i12/r2;
+            const char * base0 = (const char*)src0->data + (i12 / r2) * nb02 + (i13 / r3) * nb03;
+            char * baseDst = (char*)dst->data + i12 * nb2 + i13 * nb3;
 
-            const float * x = (float *) ((char *) src0->data + i02*nb02 + i03*nb03);
-            const float * y = (float *) ((char *) src1->data + i12*nb12 + i13*nb13);
-                  float * d = (float *) ((char *)  dst->data + i12*nb2  + i13*nb3);
-
-            if (type != GGML_TYPE_F32) {
-                x = (float *) wdata + i02*ne_plane + i03*ne02*ne_plane;
-            }
-
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        ne1, ne01, ne10,
-                        1.0f,   y, ne10,
-                                x, ne00,
-                        0.0f,   d, ne01);
+            zendnn_sgemm_bf16(
+                ne01, ne11, ne10,
+                (const ggml_bf16_t*)base0,
+                (const ggml_bf16_t*)((char *)wdata + i13 * nbw3 + i12 * nbw2),
+                (float*)baseDst
+            );
         }
     }
 }
@@ -232,7 +207,7 @@ static enum ggml_status ggml_backend_blas_graph_compute(ggml_backend_t backend, 
 
         switch (node->op) {
             case GGML_OP_MUL_MAT:
-                ggml_backend_blas_mul_mat(ctx, node);
+                ggml_backend_zendnn_mul_mat(ctx, node);
                 break;
 
             case GGML_OP_OUT_PROD:

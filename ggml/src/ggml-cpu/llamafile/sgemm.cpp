@@ -2639,21 +2639,8 @@ class tinyBLAS_PPC {
 
 #include<cstdlib>
 #include<omp.h>
-using namespace zendnn;// Include OpenMP for dynamic thread control
+using namespace zendnn;
 
-
-static inline void zendnn_set_single_thread_mode() {
-    // Force ZendNN / oneDNN to use only 1 internal thread
-    setenv("OMP_NUM_THREADS", "1", 1);
-    setenv("ZENDNN_INNER_THREADS", "1", 1);
-    setenv("ZENDNN_NUM_THREADS", "1", 1);
-    // Optional: best ISA hint for AVX-512 BF16 CPUs
-    setenv("DNNL_MAX_CPU_ISA", "AVX512_CORE_BF16", 1);
-}
-
-// -----------------------------------------------------------------------------
-// Threaded BF16 GEMM: each GGML thread computes its own slice of rows in C
-// -----------------------------------------------------------------------------
 void zendnn_sgemm_bf16_threaded(
     const ggml_compute_params *params,
     int64_t m, int64_t n, int64_t k,
@@ -2666,17 +2653,11 @@ void zendnn_sgemm_bf16_threaded(
     const int64_t nth = params->nth;
     GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
 
-    // --- ensure thread-safe init
     if (ith == 0) {
-        zendnn_set_single_thread_mode();  // disable internal ZendNN threading
         ggml_threadpool_chunk_set(params->threadpool, nth);
     }
     ggml_barrier(params->threadpool);
 
-    // -------------------------------------------------------------------------
-    // Divide rows of C (and corresponding rows of A) among threads
-    // Each thread computes rows [row0, row1) of output matrix
-    // -------------------------------------------------------------------------
     const int64_t row0 = (n *  ith     ) / nth;
     const int64_t row1 = (n * (ith + 1)) / nth;
     const int64_t n_local = row1 - row0;
@@ -2685,35 +2666,28 @@ void zendnn_sgemm_bf16_threaded(
         return;
     }
 
-    // --- oneDNN / ZendNN engine per thread
     static engine eng(engine::kind::cpu, 0);
     stream s(eng);
 
-    // Local sub-matrix shapes for this thread
     memory::dims src_dims     = {n_local, k};  // rows of A for this thread
     memory::dims weights_dims = {k, m};
     memory::dims dst_dims     = {n_local, m};
 
-    // Same layout as your original wrapper
     memory::desc src_md(src_dims, memory::data_type::bf16, memory::format_tag::ab);
     memory::desc weights_md(weights_dims, memory::data_type::bf16, memory::format_tag::ba);
     memory::desc dst_md(dst_dims, memory::data_type::f32,  memory::format_tag::ab);
 
-    // Offsets into full matrices
     const ggml_bf16_t *src_local = src + row0 * ldb;  // A slice
     float *C_local = C + row0 * ldc;                  // C slice (same rows)
 
-    // Create memory objects
     memory src_mem(src_md, eng, const_cast<ggml_bf16_t*>(src_local));
     memory weights_mem(weights_md, eng, const_cast<ggml_bf16_t*>(weights));
     memory dst_mem(dst_md, eng, C_local);
 
-    // oneDNN MatMul descriptor
     matmul::desc matmul_d(src_md, weights_md, dst_md);
     matmul::primitive_desc matmul_pd(matmul_d, eng);
     matmul matmul_prim(matmul_pd);
 
-    // Execute only this thread’s submatrix
     matmul_prim.execute(s, {
         {ZENDNN_ARG_SRC,     src_mem},
         {ZENDNN_ARG_WEIGHTS, weights_mem},
@@ -2828,22 +2802,22 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
 #if defined(__AVX512BF16__)
         if (Btype == GGML_TYPE_BF16) {
             
-            // tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{
-            //     params, k,
-            //     (const ggml_bf16_t*)A, lda,
-            //     (const ggml_bf16_t*)B, ldb,
-            //     (float*)C, ldc
-            // };
-
-            // auto ret = tb.matmul(m, n);
-            zendnn_sgemm_bf16_threaded(params,
-                m,n,k,
+            tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{
+                params, k,
                 (const ggml_bf16_t*)A, lda,
                 (const ggml_bf16_t*)B, ldb,
                 (float*)C, ldc
-            );
+            };
 
-            return true;
+            return tb.matmul(m, n);
+            // zendnn_sgemm_bf16_threaded(params,
+            //     m,n,k,
+            //     (const ggml_bf16_t*)A, lda,
+            //     (const ggml_bf16_t*)B, ldb,
+            //     (float*)C, ldc
+            // );
+
+            // return true;
 
         }
 #elif defined(__AVX512F__)

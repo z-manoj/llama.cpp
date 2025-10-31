@@ -9,7 +9,6 @@
 #include <cctype>
 #include <string>
 #include <vector>
-#include "zendnn.hpp"
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"

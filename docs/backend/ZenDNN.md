@@ -122,7 +122,7 @@ cmake -B build -DGGML_ZENDNN=ON -DGGML_ZENDNN_PATH=/path/to/ZenDNN/build/install
 cmake --build build --config Release -j $(nproc)
 ```
 
-### III. Run the Server
+### II. Run the Server
 
 #### 1. Download Model
 

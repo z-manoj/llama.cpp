@@ -25,7 +25,9 @@ For more information about ZenDNN, visit: https://www.amd.com/en/developer/zendn
 
 | OS      | Status  | Verified                                       |
 |:-------:|:-------:|:----------------------------------------------:|
-| Linux   | Support | Ubuntu 22.04, Ubuntu 20.04                     |
+| Linux   | Support | Ubuntu 20.04, 22.04, 24.04                     |
+
+For the latest list of supported operating systems, see the [ZenDNN Supported OS](https://github.com/amd/ZenDNN/blob/zendnnl/README.md#15-supported-os).
 
 ## Hardware
 

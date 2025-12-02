@@ -11,9 +11,9 @@ endif()
 if (NOT GGML_ZENDNN_PATH OR GGML_ZENDNN_PATH STREQUAL "" OR GGML_ZENDNN_PATH STREQUAL "OFF")
     message(STATUS "GGML_ZENDNN_PATH not set. Automatically downloading and building ZenDNN...")
     message(STATUS "This will take several minutes on first build...")
-    
+
     include(ExternalProject)
-    
+
     set(ZENDNN_PREFIX      ${CMAKE_BINARY_DIR}/_deps/zendnn-prefix)
     set(ZENDNN_SOURCE_DIR  ${ZENDNN_PREFIX}/src/zendnn)
     set(ZENDNN_BUILD_DIR   ${ZENDNN_PREFIX}/build)
@@ -44,10 +44,10 @@ if (NOT GGML_ZENDNN_PATH OR GGML_ZENDNN_PATH STREQUAL "" OR GGML_ZENDNN_PATH STR
 
     # Add dependency so ZenDNN builds before our library
     add_dependencies(ggml-zendnn zendnn)
-    
+
     # Set GGML_ZENDNN_PATH to the installation directory
     set(GGML_ZENDNN_PATH ${ZENDNN_INSTALL_DIR})
-    
+
     message(STATUS "ZenDNN will be built to: ${GGML_ZENDNN_PATH}")
 else()
     message(STATUS "Using custom ZenDNN installation at: ${GGML_ZENDNN_PATH}")

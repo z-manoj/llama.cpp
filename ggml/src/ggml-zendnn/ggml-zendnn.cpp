@@ -39,7 +39,7 @@ zendnnl::common::data_type_t ggml_to_zendnn_type() {
  */
 template <typename TA, typename TB, typename TC>
 static bool ggml_zendnn_matmul(ggml_backend_zendnn_context * ctx, int64_t m, int64_t n, int64_t k,
-                               const TA * A, int64_t lda, const TB * B, int64_t ldb, TC * C, 
+                               const TA * A, int64_t lda, const TB * B, int64_t ldb, TC * C,
                                int64_t ldc) {
 
     zendnnl::lowoha::lowoha_params params;
@@ -88,7 +88,7 @@ static bool ggml_zendnn_sgemm(ggml_backend_zendnn_context * ctx, int64_t m, int6
             if (Btype != GGML_TYPE_F32 || Ctype != GGML_TYPE_F32)
                 return false;
             return ggml_zendnn_matmul<float, float, float>(
-                ctx, m, n, k, 
+                ctx, m, n, k,
                 (const float *)A, lda,
                 (const float *)B, ldb,
                 (float *)C, ldc);
@@ -97,13 +97,13 @@ static bool ggml_zendnn_sgemm(ggml_backend_zendnn_context * ctx, int64_t m, int6
                 return false;
             if (Ctype == GGML_TYPE_BF16)
                 return ggml_zendnn_matmul<ggml_bf16_t, ggml_bf16_t, ggml_bf16_t>(
-                    ctx, m, n, k, 
+                    ctx, m, n, k,
                     (const ggml_bf16_t *)A, lda,
                     (const ggml_bf16_t *)B, ldb,
                     (ggml_bf16_t *)C, ldc);
             if (Ctype == GGML_TYPE_F32)
                 return ggml_zendnn_matmul<ggml_bf16_t, ggml_bf16_t, float>(
-                    ctx, m, n, k, 
+                    ctx, m, n, k,
                     (const ggml_bf16_t *)A, lda,
                     (const ggml_bf16_t *)B, ldb,
                     (float *)C, ldc);
